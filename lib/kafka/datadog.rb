@@ -105,6 +105,7 @@ module Kafka
 
         Kafka::Datadog.statsd.send(type, *args, tags: tags)
       end
+      ruby2_keywords :emit
     end
 
     class ConnectionSubscriber < StatsdSubscriber
