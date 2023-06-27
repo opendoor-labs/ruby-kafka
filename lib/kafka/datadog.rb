@@ -31,7 +31,7 @@ module Kafka
 
     class << self
       def statsd
-        @statsd ||= ::Datadog::Statsd.new(host, port, namespace: namespace, tags: tags)
+        @statsd ||= ::Datadog::Statsd.new(host, port, namespace: namespace, tags: tags, single_thread: true)
       end
 
       def statsd=(statsd)
