@@ -78,11 +78,11 @@ module Kafka
       private
 
       def default_host
-        ::Datadog::Statsd.const_defined?(:Connection) ? ::Datadog::Statsd::Connection::DEFAULT_HOST : ::Datadog::Statsd::DEFAULT_HOST
+        '127.0.0.1'
       end
 
       def default_port
-        ::Datadog::Statsd.const_defined?(:Connection) ? ::Datadog::Statsd::Connection::DEFAULT_PORT : ::Datadog::Statsd::DEFAULT_PORT
+        8125
       end
 
       def clear
@@ -98,6 +98,7 @@ module Kafka
         define_method(type) do |*args|
           emit(type, *args)
         end
+        ruby2_keywords type.to_sym
       end
 
       def emit(type, *args, tags: {})
