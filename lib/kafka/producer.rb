@@ -229,6 +229,7 @@ module Kafka
 
       nil
     end
+    ruby2_keywords :produce
 
     # Sends all buffered messages to the Kafka brokers.
     #
