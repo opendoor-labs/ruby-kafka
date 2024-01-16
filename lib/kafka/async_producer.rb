@@ -246,7 +246,7 @@ module Kafka
       def produce(*args)
         retries = 0
         begin
-          @producer.produce(*args)
+          @producer.produce(args[0], **args[1])
         rescue BufferOverflow => e
           deliver_messages
           if @max_retries == -1
