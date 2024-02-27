@@ -95,10 +95,9 @@ module Kafka
       private
 
       %w[increment histogram count timing gauge].each do |type|
-        define_method(type) do |*args|
-          emit(type, *args)
+        define_method(type) do |*args, **kwargs|
+          emit(type, *args, **kwargs)
         end
-        ruby2_keywords type.to_sym
       end
 
       def emit(type, *args, tags: {})
@@ -106,7 +105,6 @@ module Kafka
 
         Kafka::Datadog.statsd.send(type, *args, tags: tags)
       end
-      ruby2_keywords :emit
     end
 
     class ConnectionSubscriber < StatsdSubscriber
