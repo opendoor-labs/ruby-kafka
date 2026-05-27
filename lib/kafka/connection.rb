@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "stringio"
+require "openssl"
 require "kafka/socket_with_timeout"
 require "kafka/ssl_socket_with_timeout"
 require "kafka/protocol/request_message"
@@ -110,7 +111,7 @@ module Kafka
 
         response
       end
-    rescue SystemCallError, EOFError, IOError => e
+    rescue SystemCallError, EOFError, IOError, OpenSSL::OpenSSLError => e
       close
 
       raise ConnectionError, "Connection error #{e.class}: #{e}"
@@ -138,6 +139,11 @@ module Kafka
       @last_request = nil
     rescue Errno::ETIMEDOUT => e
       @logger.error "Timed out while trying to connect to #{self}: #{e}"
+      raise ConnectionError, e
+    rescue OpenSSL::OpenSSLError => e
+      # Treat SSL/TLS handshake failures as connection failures so callers can
+      # fall through to the next seed broker.
+      @logger.error "SSL/TLS error while trying to connect to #{self}: #{e}"
       raise ConnectionError, e
     rescue SocketError, Errno::ECONNREFUSED, Errno::EHOSTUNREACH => e
       @logger.error "Failed to connect to #{self}: #{e}"

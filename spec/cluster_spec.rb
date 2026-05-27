@@ -89,4 +89,82 @@ describe Kafka::Cluster do
       }.to raise_exception(Kafka::ConnectionError)
     end
   end
+
+  describe "#add_target_topics" do
+    let(:broker_pool) { double(:broker_pool) }
+    let(:ssl_context) { OpenSSL::SSL::SSLContext.new }
+    let(:sasl_authenticator) { double(:sasl_authenticator) }
+    let(:connection_builder) {
+      Kafka::ConnectionBuilder.new(
+        client_id: "test",
+        logger: LOGGER,
+        instrumenter: Kafka::Instrumenter.new(client_id: "test"),
+        connect_timeout: 0.1,
+        socket_timeout: 0.1,
+        ssl_context: ssl_context,
+        sasl_authenticator: sasl_authenticator,
+      )
+    }
+    let(:bad_broker) {
+      Kafka::Broker.new(
+        connection_builder: connection_builder,
+        host: "bad-broker",
+        port: 9096,
+        logger: LOGGER,
+      )
+    }
+    let(:good_broker) { double(:good_broker, disconnect: nil) }
+    let(:seed_brokers) {
+      [
+        URI("kafka://bad-broker:9096"),
+        URI("kafka://good-broker:9096"),
+      ]
+    }
+
+    let(:cluster) {
+      Kafka::Cluster.new(
+        seed_brokers: seed_brokers,
+        broker_pool: broker_pool,
+        logger: LOGGER,
+      )
+    }
+
+    let(:metadata) {
+      Kafka::Protocol::MetadataResponse.new(
+        brokers: [
+          Kafka::BrokerInfo.new(
+            node_id: 42,
+            host: "good-broker",
+            port: 9096,
+          )
+        ],
+        controller_id: 42,
+        topics: [],
+      )
+    }
+
+    before do
+      allow(seed_brokers).to receive(:shuffle).and_return(seed_brokers.dup)
+      allow(sasl_authenticator).to receive(:authenticate!) do |connection|
+        connection.send_request(Kafka::Protocol::SaslHandshakeRequest.new("PLAIN"))
+      end
+      allow(good_broker).to receive(:fetch_metadata).and_return(metadata)
+    end
+
+    it "falls through to the next seed broker when SSL handshake fails during metadata refresh" do
+      expect(Kafka::SSLSocketWithTimeout).to receive(:new).with(
+        "bad-broker",
+        9096,
+        connect_timeout: 0.1,
+        timeout: 0.1,
+        ssl_context: ssl_context,
+      ).and_raise(OpenSSL::SSL::SSLError, "unexpected eof while reading")
+      expect(broker_pool).to receive(:connect).with("bad-broker", 9096).ordered.and_return(bad_broker)
+      expect(broker_pool).to receive(:connect).with("good-broker", 9096).ordered.and_return(good_broker)
+
+      expect {
+        cluster.add_target_topics(["greetings"])
+      }.not_to raise_error
+    end
+  end
 end
