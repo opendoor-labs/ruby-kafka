@@ -2,6 +2,15 @@
 
 Changes and additions to the library will be listed here.
 
+## Unreleased
+
+- Wrap `OpenSSL::OpenSSLError` and `EOFError` raised during `Connection#open`
+  into `Kafka::ConnectionError`. Previously an SSL/TLS handshake failure
+  (e.g. peer FIN/RST mid-handshake during an MSK broker heal) escaped
+  `Cluster#fetch_cluster_info`'s seed-broker shuffle loop because its
+  `rescue Error` only catches `Kafka::Error`. The whole consumer would
+  abort even though other seed brokers were healthy. (DEVEX-133)
+
 ## 0.7.10
 
 - Fix logger again (#762)

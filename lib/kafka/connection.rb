@@ -142,6 +142,18 @@ module Kafka
     rescue SocketError, Errno::ECONNREFUSED, Errno::EHOSTUNREACH => e
       @logger.error "Failed to connect to #{self}: #{e}"
       raise ConnectionError, e
+    rescue OpenSSL::OpenSSLError, EOFError => e
+      # SSL/TLS errors that surface during the handshake (peer FIN/RST mid-
+      # handshake, expired or untrusted certificates, etc.) bypass the
+      # connect_timeout machinery in SSLSocketWithTimeout because that
+      # only catches IO::Wait*/EAGAIN. Without this rescue, an SSL error
+      # at one seed broker escapes Cluster#fetch_cluster_info's
+      # `rescue Error` (which only catches Kafka::Error), aborting the
+      # seed-broker fall-through loop. Wrap into Kafka::ConnectionError
+      # so callers see a single, expected exception class for any
+      # "I couldn't connect to this broker" condition.
+      @logger.error "SSL/TLS handshake failed for #{self}: #{e}"
+      raise ConnectionError, e
     end
 
     def idle?

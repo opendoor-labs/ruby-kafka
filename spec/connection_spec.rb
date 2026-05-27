@@ -113,4 +113,53 @@ describe Kafka::Connection do
       expect(event.payload[:response_size]).to eq 12
     end
   end
+
+  # Regression coverage for the seed-broker fall-through bug: when SSL handshake
+  # fails mid-stream (peer FIN/RST during TLS), OpenSSL::SSL::SSLError used to
+  # escape Connection#open instead of being wrapped into Kafka::ConnectionError.
+  # Cluster#fetch_cluster_info's `rescue Error` only catches Kafka::Error, so
+  # the SSL error escaped the seed-broker shuffle loop, aborting startup even
+  # though other seeds were healthy.
+  describe "SSL handshake failure during #open" do
+    let(:ssl_connection) {
+      Kafka::Connection.new(
+        host: host,
+        port: port,
+        client_id: "test",
+        logger: logger,
+        instrumenter: Kafka::Instrumenter.new(client_id: "test"),
+        connect_timeout: 0.1,
+        socket_timeout: 0.1,
+        ssl_context: OpenSSL::SSL::SSLContext.new,
+      )
+    }
+
+    it "wraps OpenSSL::SSL::SSLError into Kafka::ConnectionError" do
+      allow(Kafka::SSLSocketWithTimeout).to receive(:new).and_raise(
+        OpenSSL::SSL::SSLError, "SSL_connect returned=1 ... unexpected eof while reading",
+      )
+
+      expect {
+        ssl_connection.send_request(double(:request, api_key: 0, encode: nil, response_class: nil))
+      }.to raise_error(Kafka::ConnectionError, /unexpected eof while reading/)
+    end
+
+    it "wraps OpenSSL::X509::CertificateError into Kafka::ConnectionError" do
+      allow(Kafka::SSLSocketWithTimeout).to receive(:new).and_raise(
+        OpenSSL::X509::CertificateError, "certificate verify failed",
+      )
+
+      expect {
+        ssl_connection.send_request(double(:request, api_key: 0, encode: nil, response_class: nil))
+      }.to raise_error(Kafka::ConnectionError, /certificate verify failed/)
+    end
+
+    it "wraps EOFError into Kafka::ConnectionError" do
+      allow(Kafka::SSLSocketWithTimeout).to receive(:new).and_raise(EOFError, "end of file reached")
+
+      expect {
+        ssl_connection.send_request(double(:request, api_key: 0, encode: nil, response_class: nil))
+      }.to raise_error(Kafka::ConnectionError, /end of file reached/)
+    end
+  end
 end
