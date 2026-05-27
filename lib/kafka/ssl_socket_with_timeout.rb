@@ -86,7 +86,10 @@ module Kafka
           raise Errno::ETIMEDOUT
         end
       end
-    rescue
+    rescue StandardError
+      # Explicit class (vs bare `rescue`) for consistency with the nested
+      # cleanup rescue below and to document intent. Bare `rescue` defaults
+      # to StandardError today; making it explicit removes reader doubt.
       begin
         close
       rescue StandardError

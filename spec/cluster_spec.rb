@@ -144,10 +144,19 @@ describe Kafka::Cluster do
     }
 
     before do
-      allow(seed_brokers).to receive(:shuffle).and_return(seed_brokers.dup)
+      # Block form (not `.and_return(seed_brokers.dup)`) so each invocation
+      # gets a fresh dup — defends against a future Cluster change that
+      # calls shuffle more than once per metadata refresh.
+      allow(seed_brokers).to receive(:shuffle) { seed_brokers.dup }
+
+      # Load-bearing: the SASL authenticate! stub calls send_request, which
+      # forces ConnectionBuilder to actually open the socket. Without this,
+      # the SSLSocketWithTimeout stub below would never fire and we wouldn't
+      # be exercising the real Connection -> SSL handshake path. Don't remove.
       allow(sasl_authenticator).to receive(:authenticate!) do |connection|
         connection.send_request(Kafka::Protocol::SaslHandshakeRequest.new("PLAIN"))
       end
+
       allow(good_broker).to receive(:fetch_metadata).and_return(metadata)
     end
 
