@@ -22,6 +22,9 @@ module Kafka
     # @param ssl_context [OpenSSL::SSL::SSLContext] which SSLContext the ssl connection should use
     # @raise [Errno::ETIMEDOUT] if the timeout is exceeded.
     def initialize(host, port, connect_timeout: nil, timeout: nil, ssl_context:)
+      @tcp_socket = nil
+      @ssl_socket = nil
+
       addr = Socket.getaddrinfo(host, nil)
       sockaddr = Socket.pack_sockaddr_in(port, addr[0][3])
 
@@ -83,6 +86,17 @@ module Kafka
           raise Errno::ETIMEDOUT
         end
       end
+    rescue StandardError
+      # Explicit class (vs bare `rescue`) for consistency with the nested
+      # cleanup rescue below and to document intent. Bare `rescue` defaults
+      # to StandardError today; making it explicit removes reader doubt.
+      begin
+        close
+      rescue StandardError
+        # Preserve the original connection setup failure; close is best-effort cleanup.
+      end
+
+      raise
     end
 
     # Reads bytes from the socket, possible with a timeout.
@@ -160,12 +174,12 @@ module Kafka
     end
 
     def close
-      @tcp_socket.close
-      @ssl_socket.close
+      @ssl_socket.close if @ssl_socket && !@ssl_socket.closed?
+      @tcp_socket.close if @tcp_socket && !@tcp_socket.closed?
     end
 
     def closed?
-      @tcp_socket.closed? || @ssl_socket.closed?
+      (@tcp_socket.nil? || @tcp_socket.closed?) || (@ssl_socket.nil? || @ssl_socket.closed?)
     end
 
     def set_encoding(encoding)

@@ -7,6 +7,7 @@ describe Kafka::Connection do
   let(:host) { "127.0.0.1" }
   let(:server) { TCPServer.new(host, 0) }
   let(:port) { server.addr[1] }
+  let(:ssl_context) { nil }
 
   let(:connection) {
     Kafka::Connection.new(
@@ -17,6 +18,7 @@ describe Kafka::Connection do
       instrumenter: Kafka::Instrumenter.new(client_id: "test"),
       connect_timeout: 0.1,
       socket_timeout: 0.1,
+      ssl_context: ssl_context,
     )
   }
 
@@ -72,6 +74,49 @@ describe Kafka::Connection do
       expect {
         connection.send_request(request)
       }.to raise_error(Kafka::ConnectionError)
+    end
+
+    it "disconnects on SSL errors during request IO" do
+      allow(connection).to receive(:write_request).and_raise(
+        OpenSSL::SSL::SSLError,
+        "tls alert",
+      )
+
+      expect(connection).to receive(:close).and_call_original
+
+      expect {
+        connection.send_request(request)
+      }.to raise_error(Kafka::ConnectionError, /tls alert/)
+    end
+
+    context "when SSL connection setup fails" do
+      let(:ssl_context) { OpenSSL::SSL::SSLContext.new }
+
+      def expect_ssl_setup_error_wrapped(error_class, message)
+        allow(Kafka::SSLSocketWithTimeout).to receive(:new).and_raise(
+          error_class,
+          message,
+        )
+
+        expect {
+          connection.send_request(request)
+        }.to raise_error(Kafka::ConnectionError, /#{Regexp.escape(message)}/)
+      end
+
+      it "wraps SSL errors in a connection error" do
+        expect_ssl_setup_error_wrapped(
+          OpenSSL::SSL::SSLError,
+          "unexpected eof while reading",
+        )
+      end
+
+      it "wraps certificate errors in a connection error" do
+        expect_ssl_setup_error_wrapped(
+          OpenSSL::X509::CertificateError,
+          "certificate verify failed",
+        )
+      end
+
     end
 
     it "re-opens the connection after a network error" do
