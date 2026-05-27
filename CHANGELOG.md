@@ -2,6 +2,11 @@
 
 Changes and additions to the library will be listed here.
 
+## Unreleased
+
+- Wrap SSL/TLS connection-open and request IO failures as `Kafka::ConnectionError`
+  so seed-broker fallback can continue when a broker closes during handshake.
+
 ## 0.7.10
 
 - Fix logger again (#762)
