@@ -32,6 +32,7 @@ module Kafka
       # An incrementing counter used to synchronize resets between the
       # foreground and background thread.
       @current_reset_counter = 0
+      @processed_reset_counter = 0
     end
 
     def subscribe(topic, max_bytes_per_partition:)
@@ -68,7 +69,7 @@ module Kafka
 
     def reset
       @current_reset_counter = current_reset_counter + 1
-      @commands << [:reset]
+      @commands << [:reset, [current_reset_counter]]
     end
 
     def data?
@@ -123,9 +124,10 @@ module Kafka
       @max_wait_time = max_wait_time
     end
 
-    def handle_reset
+    def handle_reset(reset_counter = current_reset_counter)
       @next_offsets.clear
       @queue.clear
+      @processed_reset_counter = reset_counter
     end
 
     def handle_stop(*)
@@ -170,7 +172,8 @@ module Kafka
         @next_offsets[batch.topic][batch.partition] = batch.last_offset + 1 unless batch.unknown_last_offset?
       end
 
-      @queue << [:batches, batches, current_reset_counter]
+      # A reset requested during the fetch must not make its old response appear fresh.
+      @queue << [:batches, batches, @processed_reset_counter]
     rescue Kafka::NoPartitionsToFetchFrom
       @logger.warn "No partitions to fetch from, sleeping for 1s"
       sleep 1
