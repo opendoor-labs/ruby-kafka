@@ -32,6 +32,7 @@ module Kafka
       # An incrementing counter used to synchronize resets between the
       # foreground and background thread.
       @current_reset_counter = 0
+      @processed_reset_counter = 0
     end
 
     def subscribe(topic, max_bytes_per_partition:)
@@ -68,7 +69,7 @@ module Kafka
 
     def reset
       @current_reset_counter = current_reset_counter + 1
-      @commands << [:reset]
+      @commands << [:reset, [current_reset_counter]]
     end
 
     def data?
@@ -78,12 +79,12 @@ module Kafka
     def poll
       tag, message, reset_counter = @queue.deq
 
-      # Batches are tagged with the current reset counter value. If the batch
-      # has a reset_counter < current_reset_counter, we know it was fetched
-      # prior to the most recent reset and should be discarded.
-      if tag == :batches && message.any? && current_reset_counter > reset_counter
-        @logger.warn "Skipping stale messages buffered prior to reset"
-        return tag, []
+      # Stale offset errors must not override the position chosen by a reset.
+      # librdkafka uses a fetch version barrier:
+      # https://github.com/confluentinc/librdkafka/blob/v2.15.1/src/rdkafka_partition.h#L252-L286
+      if current_reset_counter > reset_counter
+        @logger.warn "Skipping stale response buffered prior to reset"
+        return :batches, []
       end
 
       return [tag, message]
@@ -123,9 +124,10 @@ module Kafka
       @max_wait_time = max_wait_time
     end
 
-    def handle_reset
+    def handle_reset(reset_counter = current_reset_counter)
       @next_offsets.clear
       @queue.clear
+      @processed_reset_counter = reset_counter
     end
 
     def handle_stop(*)
@@ -170,12 +172,13 @@ module Kafka
         @next_offsets[batch.topic][batch.partition] = batch.last_offset + 1 unless batch.unknown_last_offset?
       end
 
-      @queue << [:batches, batches, current_reset_counter]
+      # A reset requested during the fetch must not make its old response appear fresh.
+      @queue << [:batches, batches, @processed_reset_counter]
     rescue Kafka::NoPartitionsToFetchFrom
       @logger.warn "No partitions to fetch from, sleeping for 1s"
       sleep 1
     rescue Kafka::Error => e
-      @queue << [:exception, e]
+      @queue << [:exception, e, @processed_reset_counter]
     end
 
     def fetch_batches

@@ -6,6 +6,20 @@ module Kafka
   class Error < StandardError
   end
 
+  # Retry the current message after pausing its partition, without acknowledging it.
+  class DeferredProcessing < Error
+    attr_reader :delay
+
+    def initialize(delay:)
+      unless (delay.is_a?(Integer) || delay.is_a?(Float)) && delay >= 0 && delay.to_f.finite?
+        raise ArgumentError, "delay must be a finite, non-negative number of seconds"
+      end
+
+      @delay = delay
+      super("Processing deferred for #{delay} seconds")
+    end
+  end
+
   # There was an error processing a message.
   class ProcessingError < Error
     attr_reader :topic, :partition, :offset

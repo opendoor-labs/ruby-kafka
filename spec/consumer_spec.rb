@@ -226,6 +226,196 @@ describe Kafka::Consumer do
       expect(log.string).to include "Received signal SIGTERM, shutting down"
     end
 
+    context "when processing is deferred" do
+      let(:assigned_partitions) { { "greetings" => [0, 1] } }
+      let(:fetcher) do
+        Kafka::Fetcher.new(cluster: cluster, logger: logger, instrumenter: instrumenter,
+                           max_queue_size: 10, group: group)
+      end
+
+      def batch_for(partition, *offsets)
+        records = offsets.map do |offset|
+          Kafka::FetchedMessage.new(
+            message: Kafka::Protocol::Message.new(value: "hello", offset: offset, create_time: Time.now),
+            topic: "greetings", partition: partition,
+          )
+        end
+        Kafka::FetchedBatch.new(topic: "greetings", partition: partition, messages: records,
+                                last_offset: offsets.last, highwater_mark_offset: 100)
+      end
+
+      before do
+        allow(fetcher).to receive(:start)
+        allow(fetcher).to receive(:stop)
+        allow(fetcher).to receive(:data?).and_call_original
+        allow(fetcher).to receive(:poll).and_call_original
+        allow(fetcher).to receive(:seek).and_call_original
+        allow(group).to receive(:assigned_partitions) { assigned_partitions }
+        allow(group).to receive(:assigned_to?) do |topic, partition|
+          assigned_partitions.fetch(topic, []).include?(partition)
+        end
+        allow(offset_manager).to receive(:next_offset_for).with("greetings", 0) { 12 }
+        allow(offset_manager).to receive(:next_offset_for).with("greetings", 1) { 21 }
+      end
+
+      it "rejects invalid retry delays" do
+        [-1, Float::INFINITY, Float::NAN, nil].each do |delay|
+          expect { Kafka::DeferredProcessing.new(delay: delay) }.to raise_error(ArgumentError)
+        end
+      end
+
+      it "discards buffered records, processes other partitions, and resumes at the failed offset" do
+        now = Time.now
+        seen = []
+        stale_error = Kafka::OffsetOutOfRange.new
+        stale_error.topic = "greetings"
+        stale_error.partition = 0
+        stale_error.offset = 100
+        expect(offset_manager).not_to receive(:seek_to_default)
+        fetcher.queue << [:batches, [batch_for(0, 12, 13, 14), batch_for(1, 21)], 0]
+        fetcher.queue << [:batches, [batch_for(0, 15, 16)], 0]
+        allow(fetcher).to receive(:reset).and_wrap_original do |original|
+          original.call
+          fetcher.queue << [:exception, stale_error, 0]
+          fetcher.queue << [:batches, [batch_for(1, 21)], 1]
+        end
+
+        Timecop.freeze(now) do
+          consumer.each_message do |message|
+            seen << [message.partition, message.offset]
+            if message.partition == 0 && message.offset == 13 && seen.count([0, 13]) == 1
+              raise Kafka::DeferredProcessing.new(delay: 5)
+            elsif message.partition == 1
+              expect(consumer.paused?("greetings", 0)).to eq true
+              expect(group).not_to have_received(:leave)
+              expect(offset_manager).not_to have_received(:mark_as_processed).with("greetings", 0, 13)
+              Timecop.travel(now + 6)
+              fetcher.queue << [:batches, [batch_for(0, 13, 14)], 1]
+            elsif message.offset == 14
+              consumer.stop
+            end
+          end
+        end
+
+        expect(seen).to eq [[0, 12], [0, 13], [1, 21], [0, 13], [0, 14]]
+        expect(fetcher).to have_received(:reset).once
+        expect(fetcher).to have_received(:seek).with("greetings", 0, 13).once
+        expect(offset_manager).to have_received(:mark_as_processed).with("greetings", 0, 12).once
+        expect(offset_manager).to have_received(:mark_as_processed).with("greetings", 0, 13).once
+        expect(offset_manager).not_to have_received(:mark_as_processed).with("greetings", 0, 15)
+        expect(group).to have_received(:leave).once
+        expect(heartbeat).to have_received(:trigger).at_least(:once)
+      end
+
+      it "keeps heartbeating when all assigned partitions are paused" do
+        assigned_partitions["greetings"] = [0]
+        now = Time.now
+        seen = []
+        empty_polls = 0
+        paused_heartbeats = 0
+        fetcher.queue << [:batches, [batch_for(0, 13)], 0]
+        allow(heartbeat).to receive(:trigger) do
+          paused_heartbeats += 1 if consumer.paused?("greetings", 0)
+        end
+        allow(consumer).to receive(:sleep).with(2) do
+          empty_polls += 1
+          expect(paused_heartbeats).to eq empty_polls
+          expect(consumer.paused?("greetings", 0)).to eq true
+          expect(group).not_to have_received(:leave)
+          expect(fetcher).not_to have_received(:seek).with("greetings", 0, anything)
+          Timecop.travel(now + empty_polls * 2)
+          fetcher.queue << [:batches, [batch_for(0, 13)], 1] if empty_polls == 3
+        end
+        expect(group).not_to receive(:join)
+
+        Timecop.freeze(now) do
+          consumer.each_message do |message|
+            seen << message.offset
+            raise Kafka::DeferredProcessing.new(delay: 5) if seen.size == 1
+            consumer.stop
+          end
+        end
+
+        expect(seen).to eq [13, 13]
+        expect(paused_heartbeats).to eq 3
+        expect(fetcher).to have_received(:seek).with("greetings", 0, 13).once
+        expect(offset_manager).to have_received(:mark_as_processed).with("greetings", 0, 13).once
+        expect(group).to have_received(:leave).once
+      end
+
+      it "seeks once when retrying without a delay" do
+        seen = []
+        fetcher.queue << [:batches, [batch_for(0, 13)], 0]
+        allow(fetcher).to receive(:reset).and_wrap_original do |original|
+          original.call
+          fetcher.queue << [:batches, [batch_for(0, 13)], 1]
+        end
+
+        consumer.each_message do |message|
+          seen << message.offset
+          raise Kafka::DeferredProcessing.new(delay: 0) if seen.size == 1
+          consumer.stop
+        end
+
+        expect(seen).to eq [13, 13]
+        expect(fetcher).to have_received(:seek).with("greetings", 0, 13).once
+        expect(offset_manager).to have_received(:mark_as_processed).with("greetings", 0, 13).once
+      end
+
+      it "does not implicitly mark earlier messages when automatic marking is disabled" do
+        fetcher.queue << [:batches, [batch_for(0, 12, 13, 14)], 0]
+        allow(fetcher).to receive(:reset).and_wrap_original do |original|
+          original.call
+          fetcher.queue << [:batches, [batch_for(1, 21)], 1]
+        end
+
+        consumer.each_message(automatically_mark_as_processed: false) do |message|
+          raise Kafka::DeferredProcessing.new(delay: 5) if message.partition == 0 && message.offset == 13
+          consumer.stop if message.partition == 1
+        end
+
+        expect(offset_manager).not_to have_received(:mark_as_processed)
+        expect(consumer.paused?("greetings", 0)).to eq true
+        expect(group).to have_received(:leave).once
+      end
+
+      it "recovers heartbeat errors in the native loop and does not resume a partition it lost" do
+        seen = []
+        resets = 0
+        fetcher.queue << [:batches, [batch_for(0, 13)], 0]
+        allow(group).to receive(:generation_id).and_return(1, 2)
+        allow(group).to receive(:join) { assigned_partitions["greetings"] = [1] }
+        allow(offset_manager).to receive(:clear_offsets_excluding)
+        allow(fetcher).to receive(:reset).and_wrap_original do |original|
+          original.call
+          resets += 1
+          fetcher.queue << [:batches, [batch_for(1, 21, 22)], resets]
+        end
+
+        consumer.each_message do |message|
+          seen << [message.partition, message.offset]
+          if message.partition == 0
+            raise Kafka::DeferredProcessing.new(delay: 5)
+          elsif message.offset == 21 && seen.count([1, 21]) == 1
+            raise Kafka::HeartbeatError, "rebalance required"
+          elsif message.offset == 21
+            consumer.resume("greetings", 0)
+            expect(group).not_to have_received(:leave)
+          else
+            consumer.stop
+          end
+        end
+
+        expect(seen).to eq [[0, 13], [1, 21], [1, 21], [1, 22]]
+        expect(group).to have_received(:join).once
+        expect(group).to have_received(:leave).once
+        expect(fetcher).not_to have_received(:seek).with("greetings", 0, anything)
+        expect(fetcher).to have_received(:seek).with("greetings", 1, 21).twice
+        expect(offset_manager).not_to have_received(:mark_as_processed).with("greetings", 0, 13)
+        expect(offset_manager).to have_received(:mark_as_processed).with("greetings", 1, 21).once
+      end
+    end
+
     it "seeks to the default offset when the checkpoint is invalid " do
       done = false
 

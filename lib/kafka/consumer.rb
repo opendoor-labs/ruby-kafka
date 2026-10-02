@@ -197,6 +197,8 @@ module Kafka
     #   without an exception. Once marked successful, the offsets of processed
     #   messages can be committed to Kafka.
     # @yieldparam message [Kafka::FetchedMessage] a message fetched from Kafka.
+    # @note Raise {Kafka::DeferredProcessing} to retry a message after a partition pause.
+    # @see https://github.com/karafka/karafka/blob/v2.6.1/lib/karafka/base_consumer.rb#L453-L465
     # @raise [Kafka::ProcessingError] if there was an error processing a message.
     #   The original exception will be returned by calling `#cause` on the
     #   {Kafka::ProcessingError} instance.
@@ -210,6 +212,7 @@ module Kafka
 
       consumer_loop do
         batches = fetch_batches
+        deferred = false
 
         batches.each do |batch|
           batch.messages.each do |message|
@@ -232,6 +235,11 @@ module Kafka
               begin
                 yield message unless message.is_control_record
                 @current_offsets[message.topic][message.partition] = message.offset
+              rescue DeferredProcessing => e
+                defer_message(message, e.delay)
+                deferred = true
+              rescue HeartbeatError
+                raise
               rescue => e
                 location = "#{message.topic}/#{message.partition} at offset #{message.offset}"
                 backtrace = e.backtrace.join("\n")
@@ -241,6 +249,8 @@ module Kafka
               end
             end
 
+            break if deferred
+
             mark_message_as_processed(message) if automatically_mark_as_processed
             @offset_manager.commit_offsets_if_necessary
 
@@ -248,6 +258,8 @@ module Kafka
 
             return if shutting_down?
           end
+
+          break if deferred
 
           # We've successfully processed a batch from the partition, so we can clear
           # the pause.
@@ -471,11 +483,23 @@ module Kafka
         @offset_manager.clear_offsets_excluding(@group.assigned_partitions)
       end
 
+      reset_fetcher
+    end
+
+    def defer_message(message, delay)
+      # Pausing alone cannot discard the batches already held by this iterator.
+      # https://github.com/karafka/karafka/blob/v2.6.1/lib/karafka/connection/client.rb#L245-L279
+      @current_offsets[message.topic][message.partition] = message.offset - 1
+      pause(message.topic, message.partition, timeout: delay)
+      reset_fetcher
+    end
+
+    def reset_fetcher
       @fetcher.reset
 
       @group.assigned_partitions.each do |topic, partitions|
         partitions.each do |partition|
-          if paused?(topic, partition)
+          if pause_for(topic, partition).paused?
             @logger.warn "Not fetching from #{topic}/#{partition} due to pause"
           else
             seek_to_next(topic, partition)
