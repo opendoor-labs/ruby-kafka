@@ -6,6 +6,7 @@ require "kafka/transaction_manager"
 require "kafka/broker_info"
 require "kafka/producer"
 require "kafka/consumer"
+require "kafka/consumer_control"
 require "kafka/heartbeat"
 require "kafka/broker_uri"
 require "kafka/async_producer"
@@ -333,6 +334,9 @@ module Kafka
     # @param fetcher_max_queue_size [Integer] max number of items in the fetch queue that
     #   are stored for further processing. Note, that each item in the queue represents a
     #   response from a single broker.
+    # @param group_coordination_timeout [Numeric, nil] request timeout in seconds for
+    #   JoinGroup and SyncGroup. Other requests keep the configured socket timeout.
+    # @param shutdown_timeout [Numeric] shared network cleanup budget in seconds.
     # @return [Consumer]
     def consumer(
         group_id:,
@@ -341,9 +345,12 @@ module Kafka
         offset_commit_threshold: 0,
         heartbeat_interval: 10,
         offset_retention_time: nil,
-        fetcher_max_queue_size: 100
+        fetcher_max_queue_size: 100,
+        group_coordination_timeout: nil,
+        shutdown_timeout: 45
     )
-      cluster = initialize_cluster
+      consumer_control = ConsumerControl.new(shutdown_timeout: shutdown_timeout)
+      cluster = initialize_cluster(consumer_control: consumer_control)
 
       instrumenter = DecoratingInstrumenter.new(@instrumenter, {
         group_id: group_id,
@@ -358,11 +365,12 @@ module Kafka
         group_id: group_id,
         session_timeout: session_timeout,
         retention_time: retention_time,
+        group_coordination_timeout: group_coordination_timeout,
         instrumenter: instrumenter,
       )
 
       fetcher = Fetcher.new(
-        cluster: initialize_cluster,
+        cluster: initialize_cluster(consumer_control: consumer_control),
         group: group,
         logger: @logger,
         instrumenter: instrumenter,
@@ -394,6 +402,7 @@ module Kafka
         fetcher: fetcher,
         session_timeout: session_timeout,
         heartbeat: heartbeat,
+        consumer_control: consumer_control,
       )
     end
 
@@ -731,9 +740,9 @@ module Kafka
 
     private
 
-    def initialize_cluster
+    def initialize_cluster(consumer_control: nil)
       broker_pool = BrokerPool.new(
-        connection_builder: @connection_builder,
+        connection_builder: consumer_control ? @connection_builder.with_consumer_control(consumer_control) : @connection_builder,
         logger: @logger,
       )
 

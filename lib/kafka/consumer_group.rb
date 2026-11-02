@@ -7,11 +7,13 @@ module Kafka
   class ConsumerGroup
     attr_reader :assigned_partitions, :generation_id, :group_id
 
-    def initialize(cluster:, logger:, group_id:, session_timeout:, retention_time:, instrumenter:)
+    def initialize(cluster:, logger:, group_id:, session_timeout:, retention_time:, instrumenter:, group_coordination_timeout: nil)
       @cluster = cluster
       @logger = TaggedLogger.new(logger)
       @group_id = group_id
       @session_timeout = session_timeout
+      @group_coordination_timeout = group_coordination_timeout
+      @joined = false
       @instrumenter = instrumenter
       @member_id = ""
       @generation_id = nil
@@ -36,7 +38,7 @@ module Kafka
     end
 
     def member?
-      !@generation_id.nil?
+      @joined
     end
 
     def join
@@ -44,25 +46,20 @@ module Kafka
         raise Kafka::Error, "Cannot join group without at least one topic subscription"
       end
 
+      @joined = false
       join_group
       synchronize
-    rescue NotCoordinatorForGroup
-      @logger.error "Failed to find coordinator for group `#{@group_id}`; retrying..."
-      sleep 1
-      @coordinator = nil
-      retry
-    rescue ConnectionError
-      @logger.error "Connection error while trying to join group `#{@group_id}`; retrying..."
-      sleep 1
+      @joined = true
+    rescue NotCoordinatorForGroup, ConnectionError
       @cluster.mark_as_stale!
       @coordinator = nil
-      retry
+      raise
     end
 
     def leave
       @logger.info "Leaving group `#{@group_id}`"
 
-      # Having a generation id indicates that we're a member of the group.
+      @joined = false
       @generation_id = nil
 
       @instrumenter.instrument("leave_group.consumer", group_id: @group_id) do
@@ -114,12 +111,12 @@ module Kafka
       end
     rescue ConnectionError, UnknownMemberId, RebalanceInProgress, IllegalGeneration => e
       @logger.error "Error sending heartbeat: #{e}"
+      @joined = false
       raise HeartbeatError, e
-    rescue NotCoordinatorForGroup
-      @logger.error "Failed to find coordinator for group `#{@group_id}`; retrying..."
-      sleep 1
+    rescue NotCoordinatorForGroup => e
       @coordinator = nil
-      retry
+      @joined = false
+      raise HeartbeatError, e
     end
 
     def to_s
@@ -140,6 +137,7 @@ module Kafka
         response = coordinator.join_group(
           group_id: @group_id,
           session_timeout: @session_timeout,
+          timeout: @group_coordination_timeout,
           member_id: @member_id,
         )
 
@@ -153,12 +151,10 @@ module Kafka
 
       @logger.info "Joined group `#{@group_id}` with member id `#{@member_id}`"
     rescue UnknownMemberId
-      @logger.error "Failed to join group; resetting member id and retrying in 1s..."
-
       @member_id = ""
-      sleep 1
-
-      retry
+      raise
+    ensure
+      @instrumenter.instrument("progress.consumer", phase: :join_group)
     end
 
     def group_leader?
@@ -183,6 +179,7 @@ module Kafka
           generation_id: @generation_id,
           member_id: @member_id,
           group_assignment: group_assignment,
+          timeout: @group_coordination_timeout,
         )
 
         Protocol.handle_error(response.error_code)
@@ -193,16 +190,14 @@ module Kafka
 
         @assigned_partitions.replace(response.member_assignment.topics)
       end
+    ensure
+      @instrumenter.instrument("progress.consumer", phase: :sync_group)
     end
 
     def coordinator
       @coordinator ||= @cluster.get_group_coordinator(group_id: @group_id)
-    rescue CoordinatorNotAvailable
-      @logger.error "Group coordinator not available for group `#{@group_id}`"
-
-      sleep 1
-
-      retry
+    ensure
+      @instrumenter.instrument("progress.consumer", phase: :coordinator)
     end
   end
 end

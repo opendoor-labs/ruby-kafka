@@ -4,6 +4,7 @@ require "kafka/consumer_group"
 require "kafka/offset_manager"
 require "kafka/fetcher"
 require "kafka/pause"
+require "kafka/consumer_control"
 
 module Kafka
 
@@ -44,7 +45,7 @@ module Kafka
   #
   class Consumer
 
-    def initialize(cluster:, logger:, instrumenter:, group:, fetcher:, offset_manager:, session_timeout:, heartbeat:)
+    def initialize(cluster:, logger:, instrumenter:, group:, fetcher:, offset_manager:, session_timeout:, heartbeat:, consumer_control: ConsumerControl.new(shutdown_timeout: 45))
       @cluster = cluster
       @logger = TaggedLogger.new(logger)
       @instrumenter = instrumenter
@@ -53,6 +54,8 @@ module Kafka
       @session_timeout = session_timeout
       @fetcher = fetcher
       @heartbeat = heartbeat
+      @consumer_control = consumer_control
+      @rejoin_required = false
 
       @pauses = Hash.new {|h, k|
         h[k] = Hash.new {|h2, k2|
@@ -115,8 +118,8 @@ module Kafka
     # @return [nil]
     def stop
       @running = false
-      @fetcher.stop
-      @cluster.disconnect
+      @stopping = true
+      @consumer_control.stop
     end
 
     # Pause processing of a specific topic partition.
@@ -405,7 +408,10 @@ module Kafka
     private
 
     def consumer_loop
-      @running = true
+      return if @stopping
+
+      @consumer_control.start
+      @running = !@stopping
       @logger.push_tags(@group.to_s)
 
       @fetcher.start
@@ -417,14 +423,15 @@ module Kafka
           end
         rescue HeartbeatError
           make_final_offsets_commit!
-          join_group if running?
+          @rejoin_required = true
         rescue OffsetCommitError
-          join_group if running?
-        rescue RebalanceInProgress
-          @logger.warn "Group rebalance in progress, re-joining..."
-          join_group if running?
+          @rejoin_required = true
+        rescue RebalanceInProgress, UnknownMemberId, IllegalGeneration, NotCoordinatorForGroup, CoordinatorNotAvailable
+          @rejoin_required = true
+          sleep 1 if running?
         rescue FetchError, NotLeaderForPartition, UnknownTopicOrPartition
           @cluster.mark_as_stale!
+          sleep 1 if running?
         rescue LeaderNotAvailable => e
           @logger.error "Leader not available; waiting 1s before retrying"
           @cluster.mark_as_stale!
@@ -432,20 +439,24 @@ module Kafka
         rescue ConnectionError => e
           @logger.error "Connection error #{e.class}: #{e.message}"
           @cluster.mark_as_stale!
+          sleep 1 if running?
         rescue SignalException => e
           @logger.warn "Received signal #{e.message}, shutting down"
           @running = false
         end
       end
     ensure
+      @consumer_control.stop
       @fetcher.stop
 
       # In order to quickly have the consumer group re-balance itself, it's
       # important that members explicitly tell Kafka when they're leaving.
       make_final_offsets_commit!
       @group.leave rescue nil
+      @cluster.disconnect
       @running = false
       @logger.pop_tags
+      @stopping = false
     end
 
     def make_final_offsets_commit!(attempts = 3)
@@ -454,7 +465,7 @@ module Kafka
       # It's important to make sure final offsets commit is done
       # As otherwise messages that have been processed after last auto-commit
       # will be processed again and that may be huge amount of messages
-      return if attempts.zero?
+      return if attempts.zero? || @consumer_control.expired?
 
       @logger.error "Retrying to make final offsets commit (#{attempts} attempts left)"
       sleep(0.1)
@@ -484,6 +495,7 @@ module Kafka
       end
 
       reset_fetcher
+      @rejoin_required = false
     end
 
     def defer_message(message, delay)
@@ -541,7 +553,8 @@ module Kafka
       # Return early if the consumer has been stopped.
       return [] if shutting_down?
 
-      join_group unless @group.member?
+      join_group if @rejoin_required || !@group.member?
+      return [] if shutting_down?
 
       trigger_heartbeat
 
