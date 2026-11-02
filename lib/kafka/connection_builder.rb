@@ -12,6 +12,12 @@ module Kafka
       @sasl_authenticator = sasl_authenticator
     end
 
+    def with_consumer_control(control)
+      builder = dup
+      builder.instance_variable_set(:@consumer_control, control)
+      builder
+    end
+
     def build_connection(host, port)
       connection = Connection.new(
         host: host,
@@ -22,6 +28,7 @@ module Kafka
         logger: @logger,
         instrumenter: @instrumenter,
         ssl_context: @ssl_context,
+        consumer_control: @consumer_control,
       )
 
       @sasl_authenticator.authenticate!(connection)

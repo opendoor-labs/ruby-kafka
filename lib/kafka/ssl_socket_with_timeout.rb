@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "socket"
+require "kafka/request_deadline"
 
 module Kafka
 
@@ -12,6 +13,7 @@ module Kafka
   # raised.
   #
   class SSLSocketWithTimeout
+    attr_accessor :request_deadline
 
     # Opens a socket.
     #
@@ -21,15 +23,16 @@ module Kafka
     # @param timeout [Integer] the read and write timeout, in seconds.
     # @param ssl_context [OpenSSL::SSL::SSLContext] which SSLContext the ssl connection should use
     # @raise [Errno::ETIMEDOUT] if the timeout is exceeded.
-    def initialize(host, port, connect_timeout: nil, timeout: nil, ssl_context:)
+    def initialize(host, port, connect_timeout: nil, timeout: nil, ssl_context:, request_deadline: nil)
       @tcp_socket = nil
       @ssl_socket = nil
 
       addr = Socket.getaddrinfo(host, nil)
       sockaddr = Socket.pack_sockaddr_in(port, addr[0][3])
 
-      @connect_timeout = connect_timeout
       @timeout = timeout
+      @request_deadline = request_deadline
+      @connect_deadline = RequestDeadline.new(connect_timeout, parent: request_deadline)
 
       @tcp_socket = Socket.new(Socket.const_get(addr[0][0]), Socket::SOCK_STREAM, 0)
       @tcp_socket.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
@@ -43,7 +46,7 @@ module Kafka
       rescue IO::WaitWritable
         # select will block until the socket is writable or the timeout
         # is exceeded, whichever comes first.
-        unless select_with_timeout(@tcp_socket, :connect_write)
+        unless @connect_deadline.wait(nil, [@tcp_socket])
           # select returns nil when the socket is not ready before timeout
           # seconds have elapsed
           @tcp_socket.close
@@ -71,7 +74,7 @@ module Kafka
         # Instead, you have to retry.
         @ssl_socket.connect_nonblock
       rescue Errno::EAGAIN, Errno::EWOULDBLOCK, IO::WaitReadable
-        if select_with_timeout(@ssl_socket, :connect_read)
+        if @connect_deadline.wait([@ssl_socket], nil)
           retry
         else
           @ssl_socket.close
@@ -79,7 +82,7 @@ module Kafka
           raise Errno::ETIMEDOUT
         end
       rescue IO::WaitWritable
-        if select_with_timeout(@ssl_socket, :connect_write)
+        if @connect_deadline.wait(nil, [@ssl_socket])
           retry
         else
           close
@@ -87,9 +90,6 @@ module Kafka
         end
       end
     rescue StandardError
-      # Explicit class (vs bare `rescue`) for consistency with the nested
-      # cleanup rescue below and to document intent. Bare `rescue` defaults
-      # to StandardError today; making it explicit removes reader doubt.
       begin
         close
       rescue StandardError
@@ -105,28 +105,17 @@ module Kafka
     # @raise [Errno::ETIMEDOUT] if the timeout is exceeded.
     # @return [String] the data that was read from the socket.
     def read(num_bytes)
-      buffer = String.new
+      deadline = @request_deadline || RequestDeadline.new(@timeout)
+      buffer = String.new(encoding: Encoding::BINARY)
 
-      until buffer.length >= num_bytes
+      until buffer.bytesize >= num_bytes
+        deadline.check!
         begin
-          # Unlike plain TCP sockets, SSL sockets don't support IO.select
-          # properly.
-          # Instead, timeouts happen on a per read basis, and we have to
-          # catch exceptions from read_nonblock and gradually build up
-          # our read buffer.
-          buffer << @ssl_socket.read_nonblock(num_bytes - buffer.length)
+          buffer << @ssl_socket.read_nonblock(num_bytes - buffer.bytesize)
         rescue IO::WaitReadable
-          if select_with_timeout(@ssl_socket, :read)
-            retry
-          else
-            raise Errno::ETIMEDOUT
-          end
+          deadline.wait([@ssl_socket], nil)
         rescue IO::WaitWritable
-          if select_with_timeout(@ssl_socket, :write)
-            retry
-          else
-            raise Errno::ETIMEDOUT
-          end
+          deadline.wait(nil, [@ssl_socket])
         end
       end
 
@@ -139,38 +128,19 @@ module Kafka
     # @raise [Errno::ETIMEDOUT] if the timeout is exceeded.
     # @return [Integer] the number of bytes written.
     def write(bytes)
-      loop do
-        written = 0
+      deadline = @request_deadline || RequestDeadline.new(@timeout)
+      offset = 0
+      while offset < bytes.bytesize
+        deadline.check!
         begin
-          # unlike plain tcp sockets, ssl sockets don't support IO.select
-          # properly.
-          # Instead, timeouts happen on a per write basis, and we have to
-          # catch exceptions from write_nonblock, and gradually build up
-          # our write buffer.
-          written += @ssl_socket.write_nonblock(bytes)
-        rescue Errno::EFAULT => error
-          raise error
-        rescue OpenSSL::SSL::SSLError, Errno::EAGAIN, Errno::EWOULDBLOCK, IO::WaitWritable => error
-          if error.is_a?(OpenSSL::SSL::SSLError) && error.message == 'write would block'
-            if select_with_timeout(@ssl_socket, :write)
-              retry
-            else
-              raise Errno::ETIMEDOUT
-            end
-          else
-            raise error
-          end
+          offset += @ssl_socket.write_nonblock(bytes.byteslice(offset, bytes.bytesize - offset))
+        rescue IO::WaitWritable
+          deadline.wait(nil, [@ssl_socket])
+        rescue IO::WaitReadable
+          deadline.wait([@ssl_socket], nil)
         end
-
-        # Fast, common case.
-        break if written == bytes.size
-
-        # This takes advantage of the fact that most ruby implementations
-        # have Copy-On-Write strings. Thusly why requesting a subrange
-        # of data, we actually don't copy data because the new string
-        # simply references a subrange of the original.
-        bytes = bytes[written, bytes.size]
       end
+      offset
     end
 
     def close
@@ -186,17 +156,5 @@ module Kafka
       @tcp_socket.set_encoding(encoding)
     end
 
-    def select_with_timeout(socket, type)
-      case type
-      when :connect_read
-        IO.select([socket], nil, nil, @connect_timeout)
-      when :connect_write
-        IO.select(nil, [socket], nil, @connect_timeout)
-      when :read
-        IO.select([socket], nil, nil, @timeout)
-      when :write
-        IO.select(nil, [socket], nil, @timeout)
-      end
-    end
   end
 end

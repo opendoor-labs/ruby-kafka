@@ -51,7 +51,7 @@ module Kafka
     #   broker. Default is 10 seconds.
     #
     # @return [Connection] a new connection.
-    def initialize(host:, port:, client_id:, logger:, instrumenter:, connect_timeout: nil, socket_timeout: nil, ssl_context: nil)
+    def initialize(host:, port:, client_id:, logger:, instrumenter:, connect_timeout: nil, socket_timeout: nil, ssl_context: nil, consumer_control: nil)
       @host, @port, @client_id = host, port, client_id
       @logger = TaggedLogger.new(logger)
       @instrumenter = instrumenter
@@ -59,6 +59,7 @@ module Kafka
       @connect_timeout = connect_timeout || CONNECT_TIMEOUT
       @socket_timeout = socket_timeout || SOCKET_TIMEOUT
       @ssl_context = ssl_context
+      @consumer_control = consumer_control
     end
 
     def to_s
@@ -81,7 +82,10 @@ module Kafka
     #   encoded and written.
     #
     # @return [Object] the response.
-    def send_request(request)
+    def send_request(request, timeout: nil)
+      if timeout || @consumer_control
+        @request_deadline = RequestDeadline.new(timeout || @socket_timeout, consumer_control: @consumer_control)
+      end
       api_name = Protocol.api_name(request.api_key)
 
       # Default notification payload.
@@ -96,7 +100,9 @@ module Kafka
 
       @logger.push_tags(api_name)
       @instrumenter.instrument("request.connection", notification) do
+        @request_deadline&.check!
         open unless open?
+        @socket.request_deadline = @request_deadline
 
         @correlation_id += 1
 
@@ -116,6 +122,8 @@ module Kafka
 
       raise ConnectionError, "Connection error #{e.class}: #{e}"
     ensure
+      @socket.request_deadline = nil if @socket
+      @request_deadline = nil
       @logger.pop_tags
     end
 
@@ -125,9 +133,9 @@ module Kafka
       @logger.debug "Opening connection to #{@host}:#{@port} with client id #{@client_id}..."
 
       if @ssl_context
-        @socket = SSLSocketWithTimeout.new(@host, @port, connect_timeout: @connect_timeout, timeout: @socket_timeout, ssl_context: @ssl_context)
+        @socket = SSLSocketWithTimeout.new(@host, @port, connect_timeout: @connect_timeout, timeout: @socket_timeout, ssl_context: @ssl_context, request_deadline: @request_deadline)
       else
-        @socket = SocketWithTimeout.new(@host, @port, connect_timeout: @connect_timeout, timeout: @socket_timeout)
+        @socket = SocketWithTimeout.new(@host, @port, connect_timeout: @connect_timeout, timeout: @socket_timeout, request_deadline: @request_deadline)
       end
 
       @encoder = Kafka::Protocol::Encoder.new(@socket)

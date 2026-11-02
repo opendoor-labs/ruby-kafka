@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "socket"
+require "kafka/request_deadline"
 
 module Kafka
 
@@ -12,6 +13,7 @@ module Kafka
   # raised.
   #
   class SocketWithTimeout
+    attr_accessor :request_deadline
 
     # Opens a socket.
     #
@@ -20,11 +22,12 @@ module Kafka
     # @param connect_timeout [Integer] the connection timeout, in seconds.
     # @param timeout [Integer] the read and write timeout, in seconds.
     # @raise [Errno::ETIMEDOUT] if the timeout is exceeded.
-    def initialize(host, port, connect_timeout: nil, timeout: nil)
+    def initialize(host, port, connect_timeout: nil, timeout: nil, request_deadline: nil)
       addr = Socket.getaddrinfo(host, nil)
       sockaddr = Socket.pack_sockaddr_in(port, addr[0][3])
 
       @timeout = timeout
+      @request_deadline = request_deadline
 
       @socket = Socket.new(Socket.const_get(addr[0][0]), Socket::SOCK_STREAM, 0)
       @socket.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
@@ -37,7 +40,7 @@ module Kafka
       rescue IO::WaitWritable
         # IO.select will block until the socket is writable or the timeout
         # is exceeded, whichever comes first.
-        unless IO.select(nil, [@socket], nil, connect_timeout)
+        unless RequestDeadline.new(connect_timeout, parent: request_deadline).wait(nil, [@socket])
           # IO.select returns nil when the socket is not ready before timeout
           # seconds have elapsed
           @socket.close
@@ -51,6 +54,9 @@ module Kafka
           # The socket is connected, we're good!
         end
       end
+    rescue StandardError
+      @socket.close if @socket && !@socket.closed?
+      raise
     end
 
     # Reads bytes from the socket, possible with a timeout.
@@ -59,13 +65,19 @@ module Kafka
     # @raise [Errno::ETIMEDOUT] if the timeout is exceeded.
     # @return [String] the data that was read from the socket.
     def read(num_bytes)
-      unless IO.select([@socket], nil, nil, @timeout)
-        raise Errno::ETIMEDOUT
+      deadline = @request_deadline || RequestDeadline.new(@timeout)
+      buffer = String.new(encoding: Encoding::BINARY)
+      until buffer.bytesize >= num_bytes
+        deadline.check!
+        begin
+          buffer << @socket.read_nonblock(num_bytes - buffer.bytesize)
+        rescue IO::WaitReadable
+          deadline.wait([@socket], nil)
+        rescue IO::WaitWritable
+          deadline.wait(nil, [@socket])
+        end
       end
-
-      @socket.read(num_bytes)
-    rescue IO::EAGAINWaitReadable
-      retry
+      buffer
     end
 
     # Writes bytes to the socket, possible with a timeout.
@@ -74,11 +86,19 @@ module Kafka
     # @raise [Errno::ETIMEDOUT] if the timeout is exceeded.
     # @return [Integer] the number of bytes written.
     def write(bytes)
-      unless IO.select(nil, [@socket], nil, @timeout)
-        raise Errno::ETIMEDOUT
+      deadline = @request_deadline || RequestDeadline.new(@timeout)
+      offset = 0
+      while offset < bytes.bytesize
+        deadline.check!
+        begin
+          offset += @socket.write_nonblock(bytes.byteslice(offset, bytes.bytesize - offset))
+        rescue IO::WaitWritable
+          deadline.wait(nil, [@socket])
+        rescue IO::WaitReadable
+          deadline.wait([@socket], nil)
+        end
       end
-
-      @socket.write(bytes)
+      offset
     end
 
     def close

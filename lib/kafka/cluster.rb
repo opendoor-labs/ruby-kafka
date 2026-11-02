@@ -118,7 +118,7 @@ module Kafka
     def get_group_coordinator(group_id:)
       @logger.debug "Getting group coordinator for `#{group_id}`"
       refresh_metadata_if_necessary!
-      get_coordinator(Kafka::Protocol::COORDINATOR_TYPE_GROUP, group_id)
+      get_coordinator(Kafka::Protocol::COORDINATOR_TYPE_GROUP, group_id, retry_on_unavailable: false)
     end
 
     # Finds the broker acting as the coordinator of the given transaction.
@@ -412,7 +412,7 @@ module Kafka
       connect_to_broker(cluster_info.controller_id)
     end
 
-    def get_coordinator(coordinator_type, coordinator_key)
+    def get_coordinator(coordinator_type, coordinator_key, retry_on_unavailable: true)
       cluster_info.brokers.each do |broker_info|
         begin
           broker = connect_to_broker(broker_info.node_id)
@@ -441,6 +441,8 @@ module Kafka
 
           return coordinator
         rescue CoordinatorNotAvailable
+          raise unless retry_on_unavailable
+
           @logger.debug "Coordinator not available; retrying in 1s"
           sleep 1
           retry
@@ -449,7 +451,7 @@ module Kafka
         end
       end
 
-      raise Kafka::Error, "Failed to find coordinator"
+      raise ConnectionError, "Failed to find coordinator"
     end
   end
 end

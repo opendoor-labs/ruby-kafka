@@ -167,6 +167,7 @@ describe Kafka::Cluster do
         connect_timeout: 0.1,
         timeout: 0.1,
         ssl_context: ssl_context,
+        request_deadline: nil,
       ).and_raise(OpenSSL::SSL::SSLError, "unexpected eof while reading")
       expect(broker_pool).to receive(:connect).with("bad-broker", 9096).ordered.and_return(bad_broker)
       expect(broker_pool).to receive(:connect).with("good-broker", 9096).ordered.and_return(good_broker)
