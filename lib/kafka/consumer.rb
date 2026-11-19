@@ -497,7 +497,7 @@ module Kafka
     def reset_fetcher
       @fetcher.reset
 
-      @group.assigned_partitions.each do |topic, partitions|
+      @group.subscribed_partitions.each do |topic, partitions|
         partitions.each do |partition|
           if pause_for(topic, partition).paused?
             @logger.warn "Not fetching from #{topic}/#{partition} due to pause"
